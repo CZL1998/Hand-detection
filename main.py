@@ -169,6 +169,10 @@ def run():
     still_since    = None   # timestamp when movement dropped below threshold
     last_draw_time = None   # timestamp when drawing mode was last active
 
+    fps_t     = time.time()
+    fps_count = 0
+    fps_val   = 0.0
+
     with mp_hands.Hands(
         model_complexity=0,
         max_num_hands=1,
@@ -308,14 +312,23 @@ def run():
                 hint     = "No hand detected"
                 hint_col = (100, 100, 100)
 
+            # FPS
+            fps_count += 1
+            now = time.time()
+            if now - fps_t >= 1.0:
+                fps_val   = fps_count / (now - fps_t)
+                fps_count = 0
+                fps_t     = now
+
             put(frame, hint, 10, 32, color=hint_col)
-            put(frame, "Fist = Clear  |  Q = Quit",
-                10, 58, scale=0.60, color=(130, 130, 130), thick=1)
+            put(frame, f"Fist=Clear  Q/ESC=Quit  FPS {fps_val:.0f}",
+                10, 58, scale=0.55, color=(130, 130, 130), thick=1)
 
             draw_result_bar(frame, letters, h, w)
 
             cv2.imshow("Hand Detection - Air Writing", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):   # Q or ESC
                 break
 
     cap.release()
