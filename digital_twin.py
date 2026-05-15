@@ -16,6 +16,7 @@ warnings.filterwarnings("ignore")
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 import math
+import time
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -24,8 +25,9 @@ mp_hands  = mp.solutions.hands
 mp_draw   = mp.solutions.drawing_utils
 mp_styles = mp.solutions.drawing_styles
 
-WIN   = "Hand Digital Twin"
-FOCAL = 2.5   # perspective focal length
+WIN       = "Hand Digital Twin"
+FOCAL     = 2.5    # perspective focal length
+FAST_MODE = False  # True = skip blur (lighter CPU load, for embedded target)
 
 # ── Skin shading parameters ───────────────────────────────────────────────
 SKIN_BASE = np.array([120, 175, 210], np.float32)   # BGR: warm beige skin
@@ -233,10 +235,11 @@ def _render_skin(pts3d: np.ndarray, proj: list, ph: int, pw: int) -> np.ndarray:
                       max(1, int(rA * 0.35)), max(1, int(rB * 0.35)),
                       _color(SKIN_BASE, min(1.0, shade * 1.28)))
 
-    # ── 3. Smooth skin surface ────────────────────────────────────────────
-    skin_mask = img.sum(axis=2) > 0
-    blurred   = cv2.GaussianBlur(img, (7, 7), 0)
-    img[skin_mask] = blurred[skin_mask]
+    # ── 3. Smooth skin surface (skipped in FAST_MODE) ────────────────────
+    if not FAST_MODE:
+        skin_mask = img.sum(axis=2) > 0
+        blurred   = cv2.GaussianBlur(img, (5, 5), 0)
+        img[skin_mask] = blurred[skin_mask]
 
     return img
 
@@ -284,6 +287,11 @@ def run():
     cv2.namedWindow(WIN)
     cv2.setMouseCallback(WIN, on_mouse)
 
+    # FPS tracking
+    fps_t     = time.perf_counter()
+    fps_count = 0
+    fps_val   = 0.0
+
     with mp_hands.Hands(
         model_complexity=1,
         max_num_hands=2,
@@ -324,29 +332,52 @@ def run():
             R    = _rot(view["yaw"], view["pitch"])
 
             if res.multi_hand_landmarks:
-                for hl in res.multi_hand_landmarks:
+                pairs = zip(res.multi_hand_landmarks,
+                            res.multi_handedness)
+                for hl, hd in pairs:
                     pts3d, wrist_screen = _to_3d(hl, W / H)
                     rotated = (R @ pts3d.T).T
                     proj    = _project(rotated, PW, H, wrist_screen)
                     skin    = _render_skin(rotated, proj, H, PW)
                     twin    = cv2.add(twin, skin)
 
-                n = len(res.multi_hand_landmarks)
-                cv2.putText(twin, f"Hands detected: {n}", (10, H - 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 80, 80), 1, cv2.LINE_AA)
+                    # Label Left / Right near the wrist projection
+                    label = hd.classification[0].label
+                    wx, wy = proj[0]
+                    cv2.putText(twin, label, (wx + 8, wy),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                (120, 200, 120), 1, cv2.LINE_AA)
 
+            # ── HUD ───────────────────────────────────────────────────────
             cv2.putText(twin, "3D Twin  (skin)", (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (160, 160, 160), 1, cv2.LINE_AA)
-            cv2.putText(twin, "Drag to rotate  |  Q = Quit", (10, H - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 60, 60), 1, cv2.LINE_AA)
+            cv2.putText(twin, f"FPS {fps_val:.0f}", (PW - 75, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1, cv2.LINE_AA)
+            cv2.putText(twin,
+                        "Drag=rotate  R=reset  Q/ESC=quit",
+                        (10, H - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (60, 60, 60), 1, cv2.LINE_AA)
 
             # ── Combine ───────────────────────────────────────────────────
             out = np.hstack([cam_panel, twin])
             cv2.line(out, (PW, 0), (PW, H), (55, 55, 55), 2)
 
             cv2.imshow(WIN, out)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+
+            # FPS update
+            fps_count += 1
+            now = time.perf_counter()
+            if now - fps_t >= 1.0:
+                fps_val   = fps_count / (now - fps_t)
+                fps_count = 0
+                fps_t     = now
+
+            # Key handling
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):          # Q or ESC
                 break
+            if key == ord("r"):                # reset view
+                view["yaw"], view["pitch"] = 0.30, -0.20
 
     cap.release()
     cv2.destroyAllWindows()
