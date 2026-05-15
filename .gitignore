@@ -14,3 +14,7 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# VS Code / Claude Code auto-generated files
+README.md
+.claude/
