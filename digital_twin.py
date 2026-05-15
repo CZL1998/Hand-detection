@@ -107,12 +107,22 @@ def _to_3d(hand_lm, aspect: float = 1.0):
     return pts, wrist_screen
 
 
-def _project(pts: np.ndarray, pw: int, ph: int, wrist_screen: tuple):
-    """Perspective-project (N,3) → list of (px, py); wrist at its true position."""
+def _project(pts: np.ndarray, pw: int, ph: int, wrist_screen: tuple,
+             img_w: int = 0):
+    """Perspective-project (N,3) → list of (px, py); wrist at its true position.
+
+    img_w: full camera frame width.  When provided the x-anchor is aligned to
+    the camera panel crop (frame[:, img_w//2-pw//2 : img_w//2+pw//2]) so that
+    both hands keep the same relative spacing as seen in the camera panel.
+    """
     scale = ph * PROJ_SCALE
-    cx    = int(wrist_screen[0] * pw)
-    cy    = int(wrist_screen[1] * ph)
-    out   = []
+    if img_w > 0:
+        cam_offset = img_w // 2 - pw // 2   # left pixel of camera panel
+        cx = int(wrist_screen[0] * img_w) - cam_offset
+    else:
+        cx = int(wrist_screen[0] * pw)
+    cy  = int(wrist_screen[1] * ph)
+    out = []
     for x, y, z in pts:
         d = FOCAL / (FOCAL + z + 1e-6)
         out.append((int(cx + x * d * scale),
@@ -338,7 +348,7 @@ def run():
                 for hl, hd in pairs:
                     pts3d, wrist_screen = _to_3d(hl, W / H)
                     rotated = (R @ pts3d.T).T
-                    proj    = _project(rotated, PW, H, wrist_screen)
+                    proj    = _project(rotated, PW, H, wrist_screen, W)
                     skin    = _render_skin(rotated, proj, H, PW)
                     twin    = cv2.add(twin, skin)
 
