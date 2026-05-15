@@ -103,7 +103,11 @@ def _to_3d(hand_lm, aspect: float = 1.0):
     pts -= pts[0]
     pts[:, 0] *= aspect                    # correct x-axis compression
     pts[:, 1] *= -1                        # flip y: screen-down → 3D-up
-    pts /= (np.max(np.abs(pts)) + 1e-6)
+    # Normalise by wrist→middle-MCP (landmark 9) distance: a fixed bone length
+    # that stays constant regardless of finger pose, preventing fist from
+    # appearing larger than open hand.
+    ref = float(np.linalg.norm(pts[9, :2])) + 1e-6
+    pts /= ref
     return pts, wrist_screen
 
 
