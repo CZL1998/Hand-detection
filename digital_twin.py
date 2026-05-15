@@ -28,7 +28,7 @@ mp_styles = mp.solutions.drawing_styles
 WIN       = "Hand Digital Twin"
 FOCAL     = 2.5    # perspective focal length
 FAST_MODE  = False  # True = skip blur (lighter CPU load, for embedded target)
-PROJ_SCALE = 0.52   # controls 3D hand size; decrease to shrink, increase to enlarge
+PROJ_SCALE = 0.24   # controls 3D hand size; decrease to shrink, increase to enlarge
 
 # ── Skin shading parameters ───────────────────────────────────────────────
 SKIN_BASE = np.array([120, 175, 210], np.float32)   # BGR: warm beige skin
