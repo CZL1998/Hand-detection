@@ -27,7 +27,8 @@ mp_styles = mp.solutions.drawing_styles
 
 WIN       = "Hand Digital Twin"
 FOCAL     = 2.5    # perspective focal length
-FAST_MODE = False  # True = skip blur (lighter CPU load, for embedded target)
+FAST_MODE  = False  # True = skip blur (lighter CPU load, for embedded target)
+PROJ_SCALE = 0.52   # controls 3D hand size; decrease to shrink, increase to enlarge
 
 # ── Skin shading parameters ───────────────────────────────────────────────
 SKIN_BASE = np.array([120, 175, 210], np.float32)   # BGR: warm beige skin
@@ -108,7 +109,7 @@ def _to_3d(hand_lm, aspect: float = 1.0):
 
 def _project(pts: np.ndarray, pw: int, ph: int, wrist_screen: tuple):
     """Perspective-project (N,3) → list of (px, py); wrist at its true position."""
-    scale = ph * 0.72
+    scale = ph * PROJ_SCALE
     cx    = int(wrist_screen[0] * pw)
     cy    = int(wrist_screen[1] * ph)
     out   = []
@@ -124,7 +125,7 @@ def _project(pts: np.ndarray, pw: int, ph: int, wrist_screen: tuple):
 def _proj_radius(r3d: float, z: float, ph: int) -> int:
     """Convert a 3-D radius to a screen-space pixel radius."""
     d = FOCAL / (FOCAL + float(z) + 1e-6)
-    return max(2, int(r3d * d * ph * 0.72))
+    return max(2, int(r3d * d * ph * PROJ_SCALE))
 
 
 def _skin_shade(a3d: np.ndarray, b3d: np.ndarray) -> float:
