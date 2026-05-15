@@ -1,0 +1,16 @@
+# Model weights (large binary, regenerate with train_model.py)
+*.keras
+*.h5
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Dataset cache (tensorflow_datasets downloads)
+~/tensorflow_datasets/
+
+# Virtual environment
+.venv/
+venv/
+env/
