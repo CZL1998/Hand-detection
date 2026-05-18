@@ -32,8 +32,10 @@ MOVE_THRESH     = 0.012  # normalised movement below this = "still"
 MIN_POINTS  = 20     # minimum trajectory points required to attempt recognition
 TRAIL_THICK = 12     # drawing stroke width (pixels on full-res canvas)
 TRAIL_COLOR = (255, 255, 255)
-CONF_THRESH = 0.45   # minimum CNN confidence to accept a letter
-MAX_LETTERS = 24     # maximum letters shown in result bar
+CONF_THRESH     = 0.45   # minimum CNN confidence to accept a letter
+MAX_LETTERS     = 24     # maximum letters shown in result bar
+SPACE_HOLD_SECS = 0.8    # hold V/peace sign to insert space
+BACK_HOLD_SECS  = 0.8    # hold pinky-only to delete last character
 
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
@@ -72,6 +74,26 @@ def is_fist(lm):
         lm[12].y > lm[10].y and
         lm[16].y > lm[14].y and
         lm[20].y > lm[18].y
+    )
+
+
+def is_peace(lm):
+    """V/peace sign: index + middle up, ring + pinky curled."""
+    return (
+        lm[8].y  < lm[6].y and
+        lm[12].y < lm[10].y and
+        lm[16].y > lm[14].y and
+        lm[20].y > lm[18].y
+    )
+
+
+def is_pinky_only(lm):
+    """Pinky only extended, other three fingers curled."""
+    return (
+        lm[8].y  > lm[6].y and
+        lm[12].y > lm[10].y and
+        lm[16].y > lm[14].y and
+        lm[20].y < lm[18].y
     )
 
 
@@ -168,6 +190,8 @@ def run():
     last_norm      = None   # normalised (x, y) of fingertip last frame
     still_since    = None   # timestamp when movement dropped below threshold
     last_draw_time = None   # timestamp when drawing mode was last active
+    space_since    = None   # timestamp when V/peace hold started
+    back_since     = None   # timestamp when pinky hold started
 
     fps_t     = time.time()
     fps_count = 0
@@ -211,6 +235,8 @@ def run():
                 if only_index_up(lm):
                     drawing        = True
                     last_draw_time = time.time()
+                    space_since    = None
+                    back_since     = None
                     tip_norm       = (lm[8].x, lm[8].y)
 
                     # Draw stroke on canvas — but don't connect across a gap
@@ -246,14 +272,48 @@ def run():
 
                 elif is_fist(lm):
                     # Fist always clears, even within gap
-                    letters = ""
+                    letters        = ""
+                    space_since    = None
+                    back_since     = None
                     reset_drawing(canvas, trajectory)
                     last_draw_time = None
                     last_norm      = None
                     still_since    = None
 
+                elif is_peace(lm):
+                    # V/peace sign held → insert space
+                    back_since  = None
+                    still_since = None
+                    last_norm   = None
+                    reset_drawing(canvas, trajectory)
+                    last_draw_time = None
+                    if space_since is None:
+                        space_since = time.time()
+                    elif time.time() - space_since >= SPACE_HOLD_SECS:
+                        if letters and letters[-1] != " ":
+                            letters = (letters + " ")[-MAX_LETTERS:]
+                            print("  → [space]")
+                        space_since = None
+
+                elif is_pinky_only(lm):
+                    # Pinky held → delete last character
+                    space_since = None
+                    still_since = None
+                    last_norm   = None
+                    reset_drawing(canvas, trajectory)
+                    last_draw_time = None
+                    if back_since is None:
+                        back_since = time.time()
+                    elif time.time() - back_since >= BACK_HOLD_SECS:
+                        if letters:
+                            letters    = letters[:-1]
+                            print("  → [backspace]")
+                        back_since = None
+
                 else:
                     # Pen lifted — check stroke gap window
+                    space_since = None
+                    back_since  = None
                     in_gap = (last_draw_time is not None and
                               time.time() - last_draw_time <= STROKE_GAP_SECS)
                     if in_gap:
@@ -280,6 +340,8 @@ def run():
                     last_draw_time = None
                 last_norm   = None
                 still_since = None
+                space_since = None
+                back_since  = None
                 tip_px      = None
 
             # ── Composite drawing canvas onto frame ──────────────────────
@@ -295,6 +357,16 @@ def run():
                     cv2.ellipse(frame, tip_px, (18, 18),
                                 -90, 0, int(360 * prog),
                                 (0, 255, 100), 3, cv2.LINE_AA)
+                elif space_since:
+                    prog = min((time.time() - space_since) / SPACE_HOLD_SECS, 1.0)
+                    cv2.ellipse(frame, tip_px, (18, 18),
+                                -90, 0, int(360 * prog),
+                                (0, 220, 220), 3, cv2.LINE_AA)
+                elif back_since:
+                    prog = min((time.time() - back_since) / BACK_HOLD_SECS, 1.0)
+                    cv2.ellipse(frame, tip_px, (18, 18),
+                                -90, 0, int(360 * prog),
+                                (200, 100, 220), 3, cv2.LINE_AA)
 
             # ── Status hint ───────────────────────────────────────────────
             pen_up_in_gap = (not drawing and last_draw_time is not None and
@@ -305,6 +377,12 @@ def run():
             elif pen_up_in_gap:
                 hint     = "Pen up — extend index to continue stroke"
                 hint_col = (0, 200, 255)
+            elif space_since is not None:
+                hint     = "V sign — hold to insert space"
+                hint_col = (0, 220, 220)
+            elif back_since is not None:
+                hint     = "Pinky — hold to backspace"
+                hint_col = (200, 100, 220)
             elif res.multi_hand_landmarks:
                 hint     = "Extend index finger to draw"
                 hint_col = (200, 200, 200)
@@ -321,8 +399,8 @@ def run():
                 fps_t     = now
 
             put(frame, hint, 10, 32, color=hint_col)
-            put(frame, f"Fist=Clear  Q/ESC=Quit  FPS {fps_val:.0f}",
-                10, 58, scale=0.55, color=(130, 130, 130), thick=1)
+            put(frame, f"Fist=Clear  V=Space  Pinky=Back  Q/ESC=Quit  FPS {fps_val:.0f}",
+                10, 58, scale=0.50, color=(130, 130, 130), thick=1)
 
             draw_result_bar(frame, letters, h, w)
 

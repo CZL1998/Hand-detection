@@ -6,13 +6,44 @@ Coordinate system (MediaPipe normalised):
   x: 0 = left, 1 = right
   y: 0 = top,  1 = bottom  ← smaller y means higher in the image
   z: depth (not used here)
+
+Fist-family letters (E, M, N, S, T) are handled by a small SVM trained with
+collect_fist_data.py + train_fist_classifier.py.  While no model file exists
+the code falls back to geometric heuristics.
 """
 import math
+import os
+import numpy as np
+
+# ML models — loaded once at import time.
+# asl_classifier.pkl  (full 24-letter model) takes priority over
+# fist_classifier.pkl (fist-family only).  Geometric heuristics are the fallback.
+_ASL_MODEL  = None   # full 24-letter model (train_classifier.py)
+_FIST_MODEL = None   # fist-family model    (train_fist_classifier.py)
+try:
+    import joblib
+    _DIR = os.path.dirname(__file__)
+    _asl_pkl  = os.path.join(_DIR, "asl_classifier.pkl")
+    _fist_pkl = os.path.join(_DIR, "fist_classifier.pkl")
+    if os.path.exists(_asl_pkl):
+        _ASL_MODEL  = joblib.load(_asl_pkl)
+    elif os.path.exists(_fist_pkl):
+        _FIST_MODEL = joblib.load(_fist_pkl)
+except Exception:
+    pass
 
 
 def _d(a, b):
     """2-D Euclidean distance between two landmarks."""
     return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def _fist_features(lm):
+    """63-d feature vector: landmarks centred at wrist, scaled by wrist→MCP9."""
+    pts = np.array([[l.x, l.y, l.z] for l in lm], dtype=np.float32)
+    pts -= pts[0]                                       # origin = wrist
+    pts /= (float(np.linalg.norm(pts[9, :2])) + 1e-6)  # normalise scale
+    return pts.flatten()
 
 
 def classify_asl(hand_landmarks, handedness_label):
@@ -27,6 +58,14 @@ def classify_asl(hand_landmarks, handedness_label):
         Single uppercase letter A-Z, or '?' for uncertain / dynamic gestures.
     """
     lm = hand_landmarks.landmark
+
+    # ── Full 24-letter ML model (highest priority) ────────────────────
+    if _ASL_MODEL is not None:
+        feats  = _fist_features(lm)
+        scaled = _ASL_MODEL["scaler"].transform(feats.reshape(1, -1))
+        idx    = int(_ASL_MODEL["clf"].predict(scaled)[0])
+        return _ASL_MODEL["labels"][idx]
+
     right = (handedness_label == "Right")
 
     # ── Reference length: wrist → middle-finger MCP ─────────────────
@@ -83,12 +122,20 @@ def classify_asl(hand_landmarks, handedness_label):
     # ── 2 fingers up ────────────────────────────────────────────────
     if n == 2:
         if idx_up and mid_up:
-            if im < 0.22:                   # tips nearly touching → R (crossed)
+            # R: index wraps over middle — tips x-order reverses relative to MCPs
+            mcp_idx_left = lm[5].x < lm[9].x   # index MCP left of middle MCP?
+            tip_idx_left = lm[8].x < lm[12].x   # index TIP left of middle TIP?
+            is_crossed   = (mcp_idx_left != tip_idx_left)
+            if is_crossed:
                 return "R"
-            if thumb_out and thumb_high:    # thumb between two fingers → K
+            # K: thumb elevated AND positioned between the two finger tips
+            # catches both lateral (thumb_out) and forward thumb orientations
+            lo_x, hi_x         = min(lm[8].x, lm[12].x), max(lm[8].x, lm[12].x)
+            thumb_between_pair  = lo_x < lm[4].x < hi_x
+            if (thumb_out or thumb_between_pair) and thumb_high:
                 return "K"
             return "V" if im_h > 0.20 else "U"
-        return "U"                          # other 2-up combinations → closest
+        return "U"                               # other 2-up combinations → closest
 
     # ── 1 finger up ─────────────────────────────────────────────────
     if n == 1:
@@ -112,8 +159,10 @@ def classify_asl(hand_landmarks, handedness_label):
     if ti < 0.40 and tm < 0.50 and tr < 0.60:
         return "O"
 
-    # C: open curve — tips moderately far from thumb, thumb not extended
-    if 0.35 < ti < 0.80 and not thumb_out:
+    # C: open curve
+    # Wider ti range tolerates angle variation; ir/mr lower-bound keeps E separated
+    # (E has deeply-curled fingers with ir/mr < 0.45, C stays above 0.40)
+    if 0.30 < ti < 0.88 and ir > 0.40 and mr > 0.40 and not thumb_out:
         return "C"
 
     # Q: thumb + index both point downward
@@ -126,22 +175,43 @@ def classify_asl(hand_landmarks, handedness_label):
     if thumb_out:
         return "A"
 
+    # ML classifier for E / M / N / S / T (trained via collect_fist_data.py)
+    if _FIST_MODEL is not None:
+        feats  = _fist_features(lm)
+        scaled = _FIST_MODEL["scaler"].transform(feats.reshape(1, -1))
+        idx    = int(_FIST_MODEL["clf"].predict(scaled)[0])
+        return _FIST_MODEL["labels"][idx]
+
+    # ── Geometric fallbacks (active until model is trained) ──────────
+
     # E: all four fingertips deeply curled toward palm
     if ir < 0.45 and mr < 0.45 and rr < 0.45 and pr < 0.45:
         return "E"
 
-    # T: thumb tip horizontally between index MCP and middle MCP
+    # T: thumb pokes up between index and middle from the palm side.
+    # Require a margin so S (thumb near MCP area) doesn't mis-fire here.
     lx, rx = sorted([lm[5].x, lm[9].x])
-    if lx < lm[4].x < rx and lm[4].y > lm[5].y:
+    span   = rx - lx
+    if (lx + span * 0.1 < lm[4].x < rx - span * 0.1
+            and lm[4].y > lm[5].y + (lm[0].y - lm[5].y) * 0.15):
         return "T"
 
-    # M / N: fingers draped over thumb; distinguish by which MCPs are nearby
-    dx_ring   = abs(lm[4].x - lm[13].x) / ref
-    dx_middle = abs(lm[4].x - lm[9].x)  / ref
-    if dx_ring < 0.28:
+    # S vs M/N — the critical distinction is DEPTH ORDER:
+    #   S   : thumb wraps to the FRONT of the fist  (closer to camera → smaller z)
+    #   M/N : fingers drape OVER the thumb           (finger tips closer → smaller z)
+    #
+    # MediaPipe z: origin = wrist; more negative = closer to camera.
+    # We require a margin (0.02) so that z-noise does not flip the decision.
+    avg_tip_z = (lm[8].z + lm[12].z + lm[16].z) / 3
+    if lm[4].z < avg_tip_z - 0.02:   # thumb clearly in front → S
+        return "S"
+
+    # Thumb is behind the fingers: M (3 draped) or N (2 draped).
+    # tr = thumb-to-ring distance; small when ring finger also covers thumb.
+    dx_middle = abs(lm[4].x - lm[9].x) / ref
+    if tr < 0.45:          # ring tip near thumb → M
         return "M"
-    if dx_middle < 0.28:
+    if dx_middle < 0.32:   # thumb aligned with middle MCP → N
         return "N"
 
-    # S: thumb across curled fist (default fist)
-    return "S"
+    return "S"             # fallback (z margin was inconclusive)

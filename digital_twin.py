@@ -25,6 +25,9 @@ mp_hands  = mp.solutions.hands
 mp_draw   = mp.solutions.drawing_utils
 mp_styles = mp.solutions.drawing_styles
 
+from collections import deque, Counter
+from classifier import classify_asl
+
 WIN       = "Hand Digital Twin"
 FOCAL     = 2.5    # perspective focal length
 FAST_MODE  = False  # True = skip blur (lighter CPU load, for embedded target)
@@ -41,27 +44,27 @@ _L /= np.linalg.norm(_L)
 
 # ── Joint radii (normalised 3-D units, hand spans roughly [-1, 1]) ───────
 JOINT_R = [
-    0.072,   #  0  wrist
-    0.040,   #  1  thumb CMC
-    0.037,   #  2  thumb MCP
-    0.033,   #  3  thumb IP
-    0.029,   #  4  thumb TIP
-    0.044,   #  5  index MCP
-    0.036,   #  6  index PIP
-    0.031,   #  7  index DIP
-    0.027,   #  8  index TIP
-    0.042,   #  9  middle MCP
-    0.036,   # 10  middle PIP
-    0.032,   # 11  middle DIP
-    0.028,   # 12  middle TIP
-    0.040,   # 13  ring MCP
-    0.034,   # 14  ring PIP
-    0.029,   # 15  ring DIP
-    0.025,   # 16  ring TIP
-    0.037,   # 17  pinky MCP
-    0.030,   # 18  pinky PIP
-    0.026,   # 19  pinky DIP
-    0.022,   # 20  pinky TIP
+    0.150,   #  0  wrist
+    0.084,   #  1  thumb CMC
+    0.078,   #  2  thumb MCP
+    0.069,   #  3  thumb IP
+    0.062,   #  4  thumb TIP
+    0.093,   #  5  index MCP
+    0.075,   #  6  index PIP
+    0.065,   #  7  index DIP
+    0.057,   #  8  index TIP
+    0.089,   #  9  middle MCP
+    0.075,   # 10  middle PIP
+    0.068,   # 11  middle DIP
+    0.059,   # 12  middle TIP
+    0.084,   # 13  ring MCP
+    0.072,   # 14  ring PIP
+    0.062,   # 15  ring DIP
+    0.053,   # 16  ring TIP
+    0.078,   # 17  pinky MCP
+    0.063,   # 18  pinky PIP
+    0.054,   # 19  pinky DIP
+    0.047,   # 20  pinky TIP
 ]
 
 # Finger bones only (no palm cross-bars)
@@ -103,10 +106,11 @@ def _to_3d(hand_lm, aspect: float = 1.0):
     pts -= pts[0]
     pts[:, 0] *= aspect                    # correct x-axis compression
     pts[:, 1] *= -1                        # flip y: screen-down → 3D-up
-    # Normalise by wrist→middle-MCP (landmark 9) distance: a fixed bone length
-    # that stays constant regardless of finger pose, preventing fist from
-    # appearing larger than open hand.
-    ref = float(np.linalg.norm(pts[9, :2])) + 1e-6
+    # Normalise by wrist→middle-MCP (landmark 9) 3-D distance: a fixed bone
+    # length that stays constant regardless of finger pose OR rotation angle.
+    # Using only x,y caused size inflation when the hand rotated (MCP9 shifted
+    # into z, shrinking the 2-D projection and blowing up the scale factor).
+    ref = float(np.linalg.norm(pts[9])) + 1e-6
     pts /= ref
     return pts, wrist_screen
 
@@ -270,6 +274,36 @@ def _make_bg(h: int, w: int) -> np.ndarray:
     return bg
 
 
+# ── Deduplication ────────────────────────────────────────────────────────
+
+def _dedup_hands(lm_list, hd_list, thresh=0.10):
+    """Return a deduplicated list of (landmark, handedness) pairs.
+
+    MediaPipe occasionally re-detects the same hand twice in a single frame
+    (identical wrist position, different handedness label).  When two wrists
+    are closer than `thresh` normalised units we keep only the one with the
+    higher classification confidence and discard the other.
+    """
+    n = len(lm_list)
+    if n < 2:
+        return list(zip(lm_list, hd_list))
+    drop = set()
+    for i in range(n):
+        if i in drop:
+            continue
+        wi = lm_list[i].landmark[0]
+        ci = hd_list[i].classification[0].score
+        for j in range(i + 1, n):
+            if j in drop:
+                continue
+            wj = lm_list[j].landmark[0]
+            dist = ((wi.x - wj.x) ** 2 + (wi.y - wj.y) ** 2) ** 0.5
+            if dist < thresh:
+                cj = hd_list[j].classification[0].score
+                drop.add(j if ci >= cj else i)
+    return [(lm_list[i], hd_list[i]) for i in range(n) if i not in drop]
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def run():
@@ -307,6 +341,8 @@ def run():
     fps_count = 0
     fps_val   = 0.0
 
+    letter_histories = {}   # handedness label -> deque of recent ASL letters
+
     with mp_hands.Hands(
         model_complexity=1,
         max_num_hands=2,
@@ -328,14 +364,18 @@ def run():
             res = hands.process(rgb)
             rgb.flags.writeable = True
 
+            hand_pairs = _dedup_hands(
+                res.multi_hand_landmarks or [],
+                res.multi_handedness     or [],
+            )
+
             # ── Left panel: camera with landmarks ────────────────────────
-            if res.multi_hand_landmarks:
-                for hl in res.multi_hand_landmarks:
-                    mp_draw.draw_landmarks(
-                        frame, hl, mp_hands.HAND_CONNECTIONS,
-                        mp_styles.get_default_hand_landmarks_style(),
-                        mp_styles.get_default_hand_connections_style(),
-                    )
+            for hl, _ in hand_pairs:
+                mp_draw.draw_landmarks(
+                    frame, hl, mp_hands.HAND_CONNECTIONS,
+                    mp_styles.get_default_hand_landmarks_style(),
+                    mp_styles.get_default_hand_connections_style(),
+                )
 
             cx        = W // 2
             cam_panel = frame[:, cx - PW // 2: cx + PW // 2].copy()
@@ -343,34 +383,56 @@ def run():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (160, 160, 160), 1, cv2.LINE_AA)
 
             # ── Right panel: skin mesh ────────────────────────────────────
-            twin = bg.copy()
-            R    = _rot(view["yaw"], view["pitch"])
+            twin            = bg.copy()
+            R               = _rot(view["yaw"], view["pitch"])
+            current_letters = {}   # label -> (smoothed_letter, confidence)
 
-            if res.multi_hand_landmarks:
-                pairs = zip(res.multi_hand_landmarks,
-                            res.multi_handedness)
-                for hl, hd in pairs:
-                    pts3d, wrist_screen = _to_3d(hl, W / H)
-                    rotated = (R @ pts3d.T).T
-                    proj    = _project(rotated, PW, H, wrist_screen, W)
-                    skin    = _render_skin(rotated, proj, H, PW)
-                    twin    = cv2.add(twin, skin)
+            for hl, hd in hand_pairs:
+                pts3d, wrist_screen = _to_3d(hl, W / H)
+                rotated = (R @ pts3d.T).T
+                proj    = _project(rotated, PW, H, wrist_screen, W)
+                skin    = _render_skin(rotated, proj, H, PW)
+                twin    = cv2.add(twin, skin)
 
-                    # Label Left / Right near the wrist projection
-                    label = hd.classification[0].label
-                    wx, wy = proj[0]
-                    cv2.putText(twin, label, (wx + 8, wy),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                                (120, 200, 120), 1, cv2.LINE_AA)
+                # Label Left / Right near the wrist projection
+                label = hd.classification[0].label
+                wx, wy = proj[0]
+                cv2.putText(twin, label, (wx + 8, wy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (120, 200, 120), 1, cv2.LINE_AA)
+
+                # ASL gesture recognition with temporal smoothing
+                raw = classify_asl(hl, label)
+                if label not in letter_histories:
+                    letter_histories[label] = deque(maxlen=15)
+                letter_histories[label].append(raw)
+                counter          = Counter(letter_histories[label])
+                smoothed, cnt    = counter.most_common(1)[0]
+                conf             = cnt / len(letter_histories[label])
+                current_letters[label] = (smoothed, conf)
 
             # ── HUD ───────────────────────────────────────────────────────
             cv2.putText(twin, "3D Twin  (skin)", (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (160, 160, 160), 1, cv2.LINE_AA)
             cv2.putText(twin, f"FPS {fps_val:.0f}", (PW - 75, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1, cv2.LINE_AA)
+
+            # ASL letter overlay — one column per detected hand
+            for i, (lbl, (letter, conf)) in enumerate(
+                    sorted(current_letters.items())):
+                x     = 12 + i * (PW // 2)
+                alpha = max(0.35, conf)
+                color = tuple(int(c * alpha) for c in (0, 255, 255)) \
+                        if letter != "?" else (55, 55, 55)
+                cv2.putText(twin, letter, (x, H - 48),
+                            cv2.FONT_HERSHEY_DUPLEX, 1.8, color, 2, cv2.LINE_AA)
+                cv2.putText(twin, f"{lbl} {conf:.0%}", (x, H - 76),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, (70, 70, 70), 1,
+                            cv2.LINE_AA)
+
             cv2.putText(twin,
                         "Drag=rotate  R=reset  Q/ESC=quit",
-                        (10, H - 15),
+                        (10, H - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (60, 60, 60), 1, cv2.LINE_AA)
 
             # ── Combine ───────────────────────────────────────────────────
