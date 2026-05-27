@@ -109,6 +109,8 @@ A cyan progress ring appears around the fingertip while holding the V sign; purp
 
 The classifier covers **24 static letters**. J and Z require motion and return `?`.
 
+![ASL Finger-Spelling Chart](assets/asl_chart.jpg)
+
 ```
 A  B  C  D  E  F  G  H  I  K
 L  M  N  O  P  Q  R  S  T  U
@@ -307,6 +309,8 @@ V サインホールド中は指先にシアン色のプログレスリングが
 #### ASL 文字一覧
 
 分類器は **24 文字の静的手話**に対応しています。J と Z は動きが必要なため `?` を返します。
+
+![ASL 指文字チャート](assets/asl_chart.jpg)
 
 ```
 A  B  C  D  E  F  G  H  I  K
