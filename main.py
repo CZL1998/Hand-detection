@@ -1,205 +1,353 @@
 """
-Real-time letter recognition via air drawing.
+Hand Digital Twin — real-time 3D hand with skin rendering.
 
-Setup (one-time):
-    pip install -r requirements.txt
-    python train_model.py
+Left panel : camera feed with MediaPipe landmark overlay.
+Right panel: shaded skin-coloured 3D hand, mouse-draggable.
 
 Controls:
-    ☝  Index finger only  →  draw letter in air
-    ✊  Fist               →  clear recognised text
-    Q                     →  quit
+  Drag mouse on right panel  →  rotate 3D view (yaw / pitch)
+  Q                          →  quit
 """
 import os, warnings, logging
-os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ["TF_CPP_MIN_LOG_LEVEL"]  = "3"   # suppress TF C++ info/warning logs
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"   # suppress oneDNN notice
+os.environ.setdefault("GLOG_minloglevel", "2")  # suppress MediaPipe C++ INFO logs
 warnings.filterwarnings("ignore")
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
-import sys
+import math
 import time
-
 import cv2
 import numpy as np
 import mediapipe as mp
-import tensorflow as tf
 
-MODEL_PATH  = "letter_model.keras"
-PAUSE_SECS      = 1.5    # seconds of stillness to trigger recognition
-STROKE_GAP_SECS = 0.5    # max gap between strokes to keep the same letter alive
-MOVE_THRESH     = 0.012  # normalised movement below this = "still"
-MIN_POINTS  = 20     # minimum trajectory points required to attempt recognition
-TRAIL_THICK = 12     # drawing stroke width (pixels on full-res canvas)
-TRAIL_COLOR = (255, 255, 255)
-CONF_THRESH     = 0.45   # minimum CNN confidence to accept a letter
-MAX_LETTERS     = 24     # maximum letters shown in result bar
-SPACE_HOLD_SECS = 0.8    # hold V/peace sign to insert space
-BACK_HOLD_SECS  = 0.8    # hold pinky-only to delete last character
+mp_hands  = mp.solutions.hands
+mp_draw   = mp.solutions.drawing_utils
+mp_styles = mp.solutions.drawing_styles
 
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+from collections import deque, Counter
+from classifier import classify_asl, JZDetector
 
+WIN       = "Hand Digital Twin"
+FOCAL     = 2.5    # perspective focal length
+FAST_MODE  = False  # True = skip blur (lighter CPU load, for embedded target)
+PROJ_SCALE = 0.24   # controls 3D hand size; decrease to shrink, increase to enlarge
 
-# ── Model ────────────────────────────────────────────────────────────────
+# ── Skin shading parameters ───────────────────────────────────────────────
+SKIN_BASE = np.array([120, 175, 210], np.float32)   # BGR: warm beige skin
+AMBIENT   = 0.30
+DIFFUSE   = 0.70
 
-def load_model():
-    if not os.path.exists(MODEL_PATH):
-        print(f"[ERROR] {MODEL_PATH} not found.")
-        print("Please run:  python train_model.py")
-        sys.exit(1)
-    print(f"Loading model from {MODEL_PATH} ...")
-    m = tf.keras.models.load_model(MODEL_PATH)
-    print("Model ready.\n")
-    return m
+# Light direction (world space, pointing FROM surface TO light source)
+_L = np.array([0.35, 0.80, -0.45], np.float32)
+_L /= np.linalg.norm(_L)
 
+# ── Joint radii (normalised 3-D units, hand spans roughly [-1, 1]) ───────
+JOINT_R = [
+    0.150,   #  0  wrist
+    0.084,   #  1  thumb CMC
+    0.078,   #  2  thumb MCP
+    0.069,   #  3  thumb IP
+    0.062,   #  4  thumb TIP
+    0.093,   #  5  index MCP
+    0.075,   #  6  index PIP
+    0.065,   #  7  index DIP
+    0.057,   #  8  index TIP
+    0.089,   #  9  middle MCP
+    0.075,   # 10  middle PIP
+    0.068,   # 11  middle DIP
+    0.059,   # 12  middle TIP
+    0.084,   # 13  ring MCP
+    0.072,   # 14  ring PIP
+    0.062,   # 15  ring DIP
+    0.053,   # 16  ring TIP
+    0.078,   # 17  pinky MCP
+    0.063,   # 18  pinky PIP
+    0.054,   # 19  pinky DIP
+    0.047,   # 20  pinky TIP
+]
 
-# ── Gesture helpers ───────────────────────────────────────────────────────
+# Finger bones only (no palm cross-bars)
+BONES = [
+    (0, 1),  (1, 2),  (2, 3),  (3, 4),    # thumb
+    (0, 5),  (5, 6),  (6, 7),  (7, 8),    # index
+    (0, 9),  (9, 10), (10,11), (11,12),   # middle
+    (0,13), (13,14), (14,15), (15,16),    # ring
+    (0,17), (17,18), (18,19), (19,20),    # pinky
+]
 
-def only_index_up(lm):
-    """True when only the index finger is extended (drawing mode)."""
-    return (
-        lm[8].y  < lm[6].y and   # index tip above PIP
-        lm[12].y > lm[10].y and  # middle curled
-        lm[16].y > lm[14].y and  # ring curled
-        lm[20].y > lm[18].y      # pinky curled
-    )
+# Palm: fan of triangles from wrist
+PALM_TRIS = [(0, 1, 5), (0, 5, 9), (0, 9, 13), (0, 13, 17)]
 
-
-def is_fist(lm):
-    """True for a fully closed fist (clear gesture)."""
-    return (
-        lm[8].y  > lm[6].y and
-        lm[12].y > lm[10].y and
-        lm[16].y > lm[14].y and
-        lm[20].y > lm[18].y
-    )
-
-
-def is_peace(lm):
-    """V/peace sign: index + middle up, ring + pinky curled."""
-    return (
-        lm[8].y  < lm[6].y and
-        lm[12].y < lm[10].y and
-        lm[16].y > lm[14].y and
-        lm[20].y > lm[18].y
-    )
-
-
-def is_pinky_only(lm):
-    """Pinky only extended, other three fingers curled."""
-    return (
-        lm[8].y  > lm[6].y and
-        lm[12].y > lm[10].y and
-        lm[16].y > lm[14].y and
-        lm[20].y < lm[18].y
-    )
+# Adjacent MCP pairs for finger webbing
+WEB_PAIRS = [(5, 9), (9, 13), (13, 17)]
 
 
-# ── Recognition ──────────────────────────────────────────────────────────
+# ── 3-D math ──────────────────────────────────────────────────────────────
 
-def _letterbox(img, size=28):
-    """Resize a grayscale image to size×size preserving aspect ratio."""
-    h, w = img.shape
-    scale = size / max(h, w, 1)
-    nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
-    small = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-    out = np.zeros((size, size), dtype=np.uint8)
-    y0, x0 = (size - nh) // 2, (size - nw) // 2
-    out[y0:y0 + nh, x0:x0 + nw] = small
+def _rot(yaw: float, pitch: float) -> np.ndarray:
+    cy, sy = math.cos(yaw),   math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], np.float32)
+    Rx = np.array([[1, 0, 0],   [0, cp, -sp], [0, sp, cp]], np.float32)
+    return Rx @ Ry
+
+
+def _to_3d(hand_lm, aspect: float = 1.0):
+    """Centred, normalised (21,3) array + wrist screen position in [0,1].
+
+    aspect = image_width / image_height
+    MediaPipe normalises x by image width and y by image height, so the same
+    physical distance is smaller in x for wide cameras. Multiplying x by the
+    aspect ratio restores isotropic physical proportions.
+    """
+    pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm.landmark], np.float32)
+    wrist_screen = (float(pts[0, 0]), float(pts[0, 1]))
+    pts -= pts[0]
+    pts[:, 0] *= aspect                    # correct x-axis compression
+    pts[:, 1] *= -1                        # flip y: screen-down → 3D-up
+    # Normalise by wrist→middle-MCP (landmark 9) 3-D distance: a fixed bone
+    # length that stays constant regardless of finger pose OR rotation angle.
+    # Using only x,y caused size inflation when the hand rotated (MCP9 shifted
+    # into z, shrinking the 2-D projection and blowing up the scale factor).
+    ref = float(np.linalg.norm(pts[9])) + 1e-6
+    pts /= ref
+    return pts, wrist_screen
+
+
+def _project(pts: np.ndarray, pw: int, ph: int, wrist_screen: tuple,
+             img_w: int = 0):
+    """Perspective-project (N,3) → list of (px, py); wrist at its true position.
+
+    img_w: full camera frame width.  When provided the x-anchor is aligned to
+    the camera panel crop (frame[:, img_w//2-pw//2 : img_w//2+pw//2]) so that
+    both hands keep the same relative spacing as seen in the camera panel.
+    """
+    scale = ph * PROJ_SCALE
+    if img_w > 0:
+        cam_offset = img_w // 2 - pw // 2   # left pixel of camera panel
+        cx = int(wrist_screen[0] * img_w) - cam_offset
+    else:
+        cx = int(wrist_screen[0] * pw)
+    cy  = int(wrist_screen[1] * ph)
+    out = []
+    for x, y, z in pts:
+        d = FOCAL / (FOCAL + z + 1e-6)
+        out.append((int(cx + x * d * scale),
+                    int(cy - y * d * scale)))
     return out
 
 
-def recognise(draw_canvas, trajectory, model):
-    """Crop the drawn region from canvas and run CNN inference."""
-    if len(trajectory) < MIN_POINTS:
-        return None, 0.0
+# ── Skin rendering helpers ────────────────────────────────────────────────
 
-    xs = [p[0] for p in trajectory]
-    ys = [p[1] for p in trajectory]
-    pad = 20
-    x1 = max(0, min(xs) - pad)
-    y1 = max(0, min(ys) - pad)
-    x2 = min(draw_canvas.shape[1], max(xs) + pad)
-    y2 = min(draw_canvas.shape[0], max(ys) + pad)
-
-    roi = draw_canvas[y1:y2, x1:x2]
-    if roi.size == 0 or roi.shape[0] < 4 or roi.shape[1] < 4:
-        return None, 0.0
-
-    gray  = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    img28 = _letterbox(gray, 28)
-
-    # Slight dilation to better match EMNIST stroke width
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    img28  = cv2.dilate(img28, kernel)
-
-    inp  = img28.astype(np.float32) / 255.0
-    inp  = inp.reshape(1, 28, 28, 1)
-    pred = model.predict(inp, verbose=0)[0]
-    idx  = int(np.argmax(pred))
-    conf = float(pred[idx])
-    return chr(ord("A") + idx), conf
+def _proj_radius(r3d: float, z: float, ph: int) -> int:
+    """Convert a 3-D radius to a screen-space pixel radius."""
+    d = FOCAL / (FOCAL + float(z) + 1e-6)
+    return max(2, int(r3d * d * ph * PROJ_SCALE))
 
 
-# ── Drawing helpers ───────────────────────────────────────────────────────
-
-def put(frame, text, x, y, scale=0.75, color=(200, 200, 200), thick=2):
-    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, color, thick, cv2.LINE_AA)
-
-
-def draw_result_bar(frame, letters, h, w):
-    """Semi-transparent bottom bar with recognised letters."""
-    bar_h   = 90
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, h - bar_h), (w, h), (15, 15, 15), -1)
-    cv2.addWeighted(overlay, 0.80, frame, 0.20, 0, frame)
-    put(frame, "Recognised:", 12, h - bar_h + 22,
-        scale=0.6, color=(120, 120, 120), thick=1)
-    display = letters if letters else "—"
-    cv2.putText(frame, display, (12, h - 18),
-                cv2.FONT_HERSHEY_DUPLEX, 1.8, (0, 255, 255), 2, cv2.LINE_AA)
-
-
-def reset_drawing(canvas, trajectory):
-    canvas[:] = 0
-    trajectory.clear()
+def _skin_shade(a3d: np.ndarray, b3d: np.ndarray) -> float:
+    """Lambertian shading for the front-facing surface of a bone capsule."""
+    bone   = b3d - a3d
+    bone_n = bone / (np.linalg.norm(bone) + 1e-6)
+    view   = np.array([0., 0., 1.], np.float32)
+    side   = np.cross(bone_n, view)
+    slen   = np.linalg.norm(side)
+    if slen < 1e-4:
+        side = np.array([1., 0., 0.], np.float32)
+    else:
+        side /= slen
+    front = np.cross(side, bone_n)
+    if front[2] > 0:
+        front = -front
+    front /= (np.linalg.norm(front) + 1e-6)
+    diffuse = max(0.0, float(np.dot(front, _L)))
+    return AMBIENT + DIFFUSE * diffuse
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────
+def _fill_capsule(img: np.ndarray,
+                  pA: np.ndarray, pB: np.ndarray,
+                  rA: int, rB: int,
+                  color: tuple) -> None:
+    """Fill a tapered capsule (trapezoid + hemispherical end caps) in BGR."""
+    d  = pB - pA
+    ln = float(np.linalg.norm(d))
+    if ln < 0.5:
+        cv2.circle(img, (int(pA[0]), int(pA[1])), max(1, rA), color, -1)
+        return
+    n = np.array([-d[1], d[0]]) / ln
+
+    quad = np.round(np.array([
+        pA + rA * n,
+        pB + rB * n,
+        pB - rB * n,
+        pA - rA * n,
+    ])).astype(np.int32)
+
+    cv2.fillPoly(img, [quad], color)
+    cv2.circle(img, (int(round(pA[0])), int(round(pA[1]))), max(1, rA), color, -1)
+    cv2.circle(img, (int(round(pB[0])), int(round(pB[1]))), max(1, rB), color, -1)
+
+
+def _render_skin(pts3d: np.ndarray, proj: list, ph: int, pw: int) -> np.ndarray:
+    """
+    Render a shaded, flesh-coloured hand onto a black (ph × pw) canvas.
+
+    Pipeline:
+      1. Palm fill  — triangle fan + finger webbing quads
+      2. 3-layer bone capsules (shadow / mid / highlight) for roundness
+      3. Surface smoothing — light blur within skin region
+    """
+    img = np.zeros((ph, pw, 3), np.uint8)
+
+    def _color(base: np.ndarray, shade: float) -> tuple:
+        return tuple(int(v) for v in np.clip(base * shade, 0, 255))
+
+    light_2d  = np.array([_L[0], -_L[1]], np.float32)
+    light_2d /= np.linalg.norm(light_2d) + 1e-6
+
+    palm_ids   = [0, 1, 5, 9, 13, 17]
+    avg_y_palm = float(np.mean([pts3d[i][1] for i in palm_ids]))
+    shade_palm = float(np.clip(AMBIENT + DIFFUSE * (avg_y_palm * 0.5 + 0.6), 0.25, 1.0))
+    palm_color = _color(SKIN_BASE, shade_palm)
+
+    # ── 1a. Palm triangle fan ─────────────────────────────────────────────
+    for a, b, c in PALM_TRIS:
+        tri = np.array([proj[a], proj[b], proj[c]], np.int32)
+        cv2.fillPoly(img, [tri], palm_color)
+
+    # ── 1b. Finger webbing between adjacent MCP pairs ─────────────────────
+    for ma, mb in WEB_PAIRS:
+        pA = np.array(proj[ma],     np.float32)
+        pB = np.array(proj[mb],     np.float32)
+        nA = np.array(proj[ma + 1], np.float32)
+        nB = np.array(proj[mb + 1], np.float32)
+        wA = (pA + 0.30 * (nA - pA)).astype(np.int32)
+        wB = (pB + 0.30 * (nB - pB)).astype(np.int32)
+        quad = np.array([proj[ma], wA, wB, proj[mb]], np.int32)
+        cv2.fillPoly(img, [quad], palm_color)
+
+    # ── 2. 3-layer capsules: far → near ───────────────────────────────────
+    for i, j in sorted(BONES, key=lambda b: -(pts3d[b[0]][2] + pts3d[b[1]][2])):
+        shade = float(np.clip(_skin_shade(pts3d[i], pts3d[j]), 0.25, 1.0))
+        pA    = np.array(proj[i], np.float32)
+        pB    = np.array(proj[j], np.float32)
+        rA    = _proj_radius(JOINT_R[i], pts3d[i][2], ph)
+        rB    = _proj_radius(JOINT_R[j], pts3d[j][2], ph)
+
+        seg   = pB - pA
+        perp  = np.array([-seg[1], seg[0]], np.float32)
+        perp /= np.linalg.norm(perp) + 1e-6
+        lp    = float(np.dot(light_2d, perp))
+        off   = perp * lp * rA * 0.35
+
+        # Shadow layer — full width, darkened
+        _fill_capsule(img, pA, pB, rA, rB, _color(SKIN_BASE, shade * 0.66))
+        # Mid layer — 70% width, shifted toward light
+        _fill_capsule(img,
+                      pA + off * 0.4, pB + off * 0.4,
+                      max(1, int(rA * 0.70)), max(1, int(rB * 0.70)),
+                      _color(SKIN_BASE, shade))
+        # Highlight layer — 35% width, full shift
+        _fill_capsule(img,
+                      pA + off, pB + off,
+                      max(1, int(rA * 0.35)), max(1, int(rB * 0.35)),
+                      _color(SKIN_BASE, min(1.0, shade * 1.28)))
+
+    # ── 3. Smooth skin surface (skipped in FAST_MODE) ────────────────────
+    if not FAST_MODE:
+        skin_mask = img.sum(axis=2) > 0
+        blurred   = cv2.GaussianBlur(img, (5, 5), 0)
+        img[skin_mask] = blurred[skin_mask]
+
+    return img
+
+
+# ── Background ────────────────────────────────────────────────────────────
+
+def _make_bg(h: int, w: int) -> np.ndarray:
+    bg = np.full((h, w, 3), 8, np.uint8)
+    for x in range(0, w, 50):
+        cv2.line(bg, (x, 0), (x, h), (22, 22, 22), 1)
+    for y in range(0, h, 50):
+        cv2.line(bg, (0, y), (w, y), (22, 22, 22), 1)
+    return bg
+
+
+# ── Deduplication ────────────────────────────────────────────────────────
+
+def _dedup_hands(lm_list, hd_list, thresh=0.10):
+    """Return a deduplicated list of (landmark, handedness) pairs.
+
+    MediaPipe occasionally re-detects the same hand twice in a single frame
+    (identical wrist position, different handedness label).  When two wrists
+    are closer than `thresh` normalised units we keep only the one with the
+    higher classification confidence and discard the other.
+    """
+    n = len(lm_list)
+    if n < 2:
+        return list(zip(lm_list, hd_list))
+    drop = set()
+    for i in range(n):
+        if i in drop:
+            continue
+        wi = lm_list[i].landmark[0]
+        ci = hd_list[i].classification[0].score
+        for j in range(i + 1, n):
+            if j in drop:
+                continue
+            wj = lm_list[j].landmark[0]
+            dist = ((wi.x - wj.x) ** 2 + (wi.y - wj.y) ** 2) ** 0.5
+            if dist < thresh:
+                cj = hd_list[j].classification[0].score
+                drop.add(j if ci >= cj else i)
+    return [(lm_list[i], hd_list[i]) for i in range(n) if i not in drop]
+
+
+# ── Main ──────────────────────────────────────────────────────────────────
 
 def run():
-    model = load_model()
-
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("[ERROR] Cannot open camera.")
+        print("无法打开摄像头。")
         return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
 
-    ok, frame0 = cap.read()
-    h, w = frame0.shape[:2] if ok else (720, 1280)
+    ok, f0 = cap.read()
+    H, W   = f0.shape[:2] if ok else (720, 1280)
+    PW     = W // 2
+    bg     = _make_bg(H, PW)
 
-    canvas     = np.zeros((h, w, 3), dtype=np.uint8)
-    trajectory = []
-    letters    = ""
+    view = {"yaw": 0.30, "pitch": -0.20, "down": False, "lx": 0, "ly": 0}
 
-    last_norm      = None   # normalised (x, y) of fingertip last frame
-    still_since    = None   # timestamp when movement dropped below threshold
-    last_draw_time = None   # timestamp when drawing mode was last active
-    space_since    = None   # timestamp when V/peace hold started
-    back_since     = None   # timestamp when pinky hold started
+    def on_mouse(evt, x, y, flags, _):
+        rx = x - PW
+        if evt == cv2.EVENT_LBUTTONDOWN and rx >= 0:
+            view.update(down=True, lx=rx, ly=y)
+        elif evt == cv2.EVENT_LBUTTONUP:
+            view["down"] = False
+        elif evt == cv2.EVENT_MOUSEMOVE and view["down"]:
+            view["yaw"]   += (rx - view["lx"]) * 0.008
+            view["pitch"]  = max(-1.4, min(1.4,
+                              view["pitch"] + (y - view["ly"]) * 0.008))
+            view["lx"], view["ly"] = rx, y
 
-    fps_t     = time.time()
+    cv2.namedWindow(WIN)
+    cv2.setMouseCallback(WIN, on_mouse)
+
+    # FPS tracking
+    fps_t     = time.perf_counter()
     fps_count = 0
     fps_val   = 0.0
 
+    letter_histories = {}   # handedness label -> deque of recent ASL letters
+    jz_detectors    = {}   # handedness label -> JZDetector instance
+    jz_overrides    = {}   # handedness label -> (letter, frames_remaining)
+
     with mp_hands.Hands(
-        model_complexity=0,
-        max_num_hands=1,
+        model_complexity=1,
+        max_num_hands=2,
         min_detection_confidence=0.7,
         min_tracking_confidence=0.5,
     ) as hands:
@@ -209,205 +357,133 @@ def run():
             if not ok:
                 break
 
-            frame    = cv2.flip(frame, 1)
-            h, w     = frame.shape[:2]
-            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.flip(frame, 1)
+            H, W  = frame.shape[:2]
+            PW    = W // 2
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb.flags.writeable = False
-            res      = hands.process(rgb)
+            res = hands.process(rgb)
             rgb.flags.writeable = True
 
-            tip_px  = None
-            drawing = False
+            hand_pairs = _dedup_hands(
+                res.multi_hand_landmarks or [],
+                res.multi_handedness     or [],
+            )
 
-            if res.multi_hand_landmarks:
-                hand_lm = res.multi_hand_landmarks[0]
-                lm      = hand_lm.landmark
-
-                mp_drawing.draw_landmarks(
-                    frame, hand_lm, mp_hands.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style(),
-                    mp_drawing_styles.get_default_hand_connections_style(),
+            # ── Left panel: camera with landmarks ────────────────────────
+            for hl, _ in hand_pairs:
+                mp_draw.draw_landmarks(
+                    frame, hl, mp_hands.HAND_CONNECTIONS,
+                    mp_styles.get_default_hand_landmarks_style(),
+                    mp_styles.get_default_hand_connections_style(),
                 )
 
-                # Always compute index tip position for cursor display
-                tip_px = (int(lm[8].x * w), int(lm[8].y * h))
+            cx        = W // 2
+            cam_panel = frame[:, cx - PW // 2: cx + PW // 2].copy()
+            cv2.putText(cam_panel, "Camera", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (160, 160, 160), 1, cv2.LINE_AA)
 
-                if only_index_up(lm):
-                    drawing        = True
-                    last_draw_time = time.time()
-                    space_since    = None
-                    back_since     = None
-                    tip_norm       = (lm[8].x, lm[8].y)
+            # ── Right panel: skin mesh ────────────────────────────────────
+            twin            = bg.copy()
+            R               = _rot(view["yaw"], view["pitch"])
+            current_letters = {}   # label -> (smoothed_letter, confidence)
 
-                    # Draw stroke on canvas — but don't connect across a gap
-                    if last_norm is not None:
-                        prev_px = (int(last_norm[0] * w), int(last_norm[1] * h))
-                        cv2.line(canvas, prev_px, tip_px, TRAIL_COLOR, TRAIL_THICK)
-                    cv2.circle(canvas, tip_px, TRAIL_THICK // 2, TRAIL_COLOR, -1)
-                    trajectory.append(tip_px)
+            for hl, hd in hand_pairs:
+                pts3d, wrist_screen = _to_3d(hl, W / H)
+                rotated = (R @ pts3d.T).T
+                proj    = _project(rotated, PW, H, wrist_screen, W)
+                skin    = _render_skin(rotated, proj, H, PW)
+                twin    = cv2.add(twin, skin)
 
-                    # Movement detection
-                    if last_norm is not None:
-                        dx = tip_norm[0] - last_norm[0]
-                        dy = tip_norm[1] - last_norm[1]
-                        moved = (dx * dx + dy * dy) ** 0.5
-                        if moved < MOVE_THRESH:
-                            if still_since is None:
-                                still_since = time.time()
-                        else:
-                            still_since = None
+                # Label Left / Right near the wrist projection
+                label = hd.classification[0].label
+                wx, wy = proj[0]
+                cv2.putText(twin, label, (wx + 8, wy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (120, 200, 120), 1, cv2.LINE_AA)
 
-                    last_norm = tip_norm
+                # ASL gesture recognition with temporal smoothing
+                raw = classify_asl(hl, label)
 
-                    # Trigger recognition after pause
-                    if still_since and time.time() - still_since >= PAUSE_SECS:
-                        letter, conf = recognise(canvas, trajectory, model)
-                        if letter and conf >= CONF_THRESH:
-                            letters = (letters + letter)[-MAX_LETTERS:]
-                            print(f"  → {letter}  ({conf:.0%})")
-                        reset_drawing(canvas, trajectory)
-                        last_draw_time = None
-                        last_norm      = None
-                        still_since    = None
+                # J / Z dynamic detection
+                det    = jz_detectors.setdefault(label, JZDetector())
+                jz_hit = det.update(raw, hl.landmark)
+                if jz_hit:
+                    jz_overrides[label] = (jz_hit, 45)   # hold for ≈1.5 s
 
-                elif is_fist(lm):
-                    # Fist always clears, even within gap
-                    letters        = ""
-                    space_since    = None
-                    back_since     = None
-                    reset_drawing(canvas, trajectory)
-                    last_draw_time = None
-                    last_norm      = None
-                    still_since    = None
+                # Static letter smoothing (majority vote over 15 frames)
+                if label not in letter_histories:
+                    letter_histories[label] = deque(maxlen=15)
+                letter_histories[label].append(raw)
+                counter       = Counter(letter_histories[label])
+                smoothed, cnt = counter.most_common(1)[0]
+                conf          = cnt / len(letter_histories[label])
 
-                elif is_peace(lm):
-                    # V/peace sign held → insert space
-                    back_since  = None
-                    still_since = None
-                    last_norm   = None
-                    reset_drawing(canvas, trajectory)
-                    last_draw_time = None
-                    if space_since is None:
-                        space_since = time.time()
-                    elif time.time() - space_since >= SPACE_HOLD_SECS:
-                        if letters and letters[-1] != " ":
-                            letters = (letters + " ")[-MAX_LETTERS:]
-                            print("  → [space]")
-                        space_since = None
-
-                elif is_pinky_only(lm):
-                    # Pinky held → delete last character
-                    space_since = None
-                    still_since = None
-                    last_norm   = None
-                    reset_drawing(canvas, trajectory)
-                    last_draw_time = None
-                    if back_since is None:
-                        back_since = time.time()
-                    elif time.time() - back_since >= BACK_HOLD_SECS:
-                        if letters:
-                            letters    = letters[:-1]
-                            print("  → [backspace]")
-                        back_since = None
-
-                else:
-                    # Pen lifted — check stroke gap window
-                    space_since = None
-                    back_since  = None
-                    in_gap = (last_draw_time is not None and
-                              time.time() - last_draw_time <= STROKE_GAP_SECS)
-                    if in_gap:
-                        # User is repositioning between strokes — keep canvas alive
-                        last_norm   = None   # don't connect to old position on resume
-                        still_since = None   # pause timer paused while pen is up
+                # Dynamic result overrides static display while timer is active
+                if label in jz_overrides:
+                    jz_ltr, jz_left = jz_overrides[label]
+                    if jz_left > 0:
+                        jz_overrides[label] = (jz_ltr, jz_left - 1)
+                        current_letters[label] = (jz_ltr, 1.0)
                     else:
-                        # Gap exceeded: commit whatever is drawn
-                        if len(trajectory) >= MIN_POINTS:
-                            letter, conf = recognise(canvas, trajectory, model)
-                            if letter and conf >= CONF_THRESH:
-                                letters = (letters + letter)[-MAX_LETTERS:]
-                        reset_drawing(canvas, trajectory)
-                        last_draw_time = None
-                        last_norm      = None
-                        still_since    = None
+                        del jz_overrides[label]
+                        current_letters[label] = (smoothed, conf)
+                else:
+                    current_letters[label] = (smoothed, conf)
 
-            else:
-                # No hand detected
-                in_gap = (last_draw_time is not None and
-                          time.time() - last_draw_time <= STROKE_GAP_SECS)
-                if not in_gap:
-                    reset_drawing(canvas, trajectory)
-                    last_draw_time = None
-                last_norm   = None
-                still_since = None
-                space_since = None
-                back_since  = None
-                tip_px      = None
+            # ── HUD ───────────────────────────────────────────────────────
+            cv2.putText(twin, "3D Twin  (skin)", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (160, 160, 160), 1, cv2.LINE_AA)
+            cv2.putText(twin, f"FPS {fps_val:.0f}", (PW - 75, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1, cv2.LINE_AA)
 
-            # ── Composite drawing canvas onto frame ──────────────────────
-            drawn_mask = canvas.sum(axis=2) > 0
-            blended    = cv2.addWeighted(frame, 0.15, canvas, 0.85, 0)
-            frame[drawn_mask] = blended[drawn_mask]
+            # ASL letter overlay — one column per detected hand
+            for i, (lbl, (letter, conf)) in enumerate(
+                    sorted(current_letters.items())):
+                x          = 12 + i * (PW // 2)
+                is_dynamic = letter in ('J', 'Z') and lbl in jz_overrides
+                if is_dynamic:
+                    color    = (0, 165, 255)          # orange — dynamic gesture
+                    sub_text = f"{lbl}  J/Z dynamic"
+                elif letter == '?':
+                    color    = (55, 55, 55)
+                    sub_text = lbl
+                else:
+                    alpha    = max(0.35, conf)
+                    color    = tuple(int(c * alpha) for c in (0, 255, 255))
+                    sub_text = f"{lbl} {conf:.0%}"
+                cv2.putText(twin, letter, (x, H - 48),
+                            cv2.FONT_HERSHEY_DUPLEX, 1.8, color, 2, cv2.LINE_AA)
+                cv2.putText(twin, sub_text, (x, H - 76),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, (70, 70, 70), 1,
+                            cv2.LINE_AA)
 
-            # ── Cursor dot + pause progress ring ─────────────────────────
-            if tip_px:
-                cv2.circle(frame, tip_px, 12, (0, 180, 255), 2, cv2.LINE_AA)
-                if still_since:
-                    prog = min((time.time() - still_since) / PAUSE_SECS, 1.0)
-                    cv2.ellipse(frame, tip_px, (18, 18),
-                                -90, 0, int(360 * prog),
-                                (0, 255, 100), 3, cv2.LINE_AA)
-                elif space_since:
-                    prog = min((time.time() - space_since) / SPACE_HOLD_SECS, 1.0)
-                    cv2.ellipse(frame, tip_px, (18, 18),
-                                -90, 0, int(360 * prog),
-                                (0, 220, 220), 3, cv2.LINE_AA)
-                elif back_since:
-                    prog = min((time.time() - back_since) / BACK_HOLD_SECS, 1.0)
-                    cv2.ellipse(frame, tip_px, (18, 18),
-                                -90, 0, int(360 * prog),
-                                (200, 100, 220), 3, cv2.LINE_AA)
+            cv2.putText(twin,
+                        "Drag=rotate  R=reset  Q/ESC=quit",
+                        (10, H - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (60, 60, 60), 1, cv2.LINE_AA)
 
-            # ── Status hint ───────────────────────────────────────────────
-            pen_up_in_gap = (not drawing and last_draw_time is not None and
-                             time.time() - last_draw_time <= STROKE_GAP_SECS)
-            if drawing:
-                hint     = "Drawing... (pause 1.5 s to confirm)"
-                hint_col = (80, 255, 80)
-            elif pen_up_in_gap:
-                hint     = "Pen up — extend index to continue stroke"
-                hint_col = (0, 200, 255)
-            elif space_since is not None:
-                hint     = "V sign — hold to insert space"
-                hint_col = (0, 220, 220)
-            elif back_since is not None:
-                hint     = "Pinky — hold to backspace"
-                hint_col = (200, 100, 220)
-            elif res.multi_hand_landmarks:
-                hint     = "Extend index finger to draw"
-                hint_col = (200, 200, 200)
-            else:
-                hint     = "No hand detected"
-                hint_col = (100, 100, 100)
+            # ── Combine ───────────────────────────────────────────────────
+            out = np.hstack([cam_panel, twin])
+            cv2.line(out, (PW, 0), (PW, H), (55, 55, 55), 2)
 
-            # FPS
+            cv2.imshow(WIN, out)
+
+            # FPS update
             fps_count += 1
-            now = time.time()
+            now = time.perf_counter()
             if now - fps_t >= 1.0:
                 fps_val   = fps_count / (now - fps_t)
                 fps_count = 0
                 fps_t     = now
 
-            put(frame, hint, 10, 32, color=hint_col)
-            put(frame, f"Fist=Clear  V=Space  Pinky=Back  Q/ESC=Quit  FPS {fps_val:.0f}",
-                10, 58, scale=0.50, color=(130, 130, 130), thick=1)
-
-            draw_result_bar(frame, letters, h, w)
-
-            cv2.imshow("Hand Detection - Air Writing", frame)
+            # Key handling
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):   # Q or ESC
+            if key in (ord("q"), 27):          # Q or ESC
                 break
+            if key == ord("r"):                # reset view
+                view["yaw"], view["pitch"] = 0.30, -0.20
 
     cap.release()
     cv2.destroyAllWindows()

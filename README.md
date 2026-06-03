@@ -13,9 +13,9 @@
 
 A real-time hand-tracking application built with **MediaPipe** and **OpenCV**, featuring:
 
-- **Air Writing** — draw letters in the air with your index finger and recognize them with a CNN
 - **3D Digital Twin** — perspective-rendered skin-mesh hand that mirrors your real hand in real time
-- **ASL Finger-Spelling Recognition** — classifies 24 static American Sign Language letters (A–Y, excluding J & Z which require motion)
+- **ASL Finger-Spelling Recognition** — classifies all 26 American Sign Language letters (A–Z); J & Z detected via motion trajectory
+- **Air Writing** — draw letters in the air with your index finger and recognize them with a CNN
 - **ML Training Pipeline** — collect your own training data and train a custom SVM/MLP classifier
 
 ---
@@ -24,8 +24,8 @@ A real-time hand-tracking application built with **MediaPipe** and **OpenCV**, f
 
 | Module | Description |
 |--------|-------------|
-| `main.py` | Air-writing canvas with gesture shortcuts |
-| `digital_twin.py` | 3D hand twin + live ASL letter overlay |
+| `main.py` | **Main program** — 3D hand twin + live ASL letter overlay |
+| `air_writing.py` | Extension — air-writing canvas with gesture shortcuts |
 | `classifier.py` | ASL classifier (geometric rules + optional ML model) |
 | `collect_data.py` | Capture training samples for all 24 ASL letters |
 | `collect_fist_data.py` | Capture training samples for fist-family letters (E/M/N/S/T) |
@@ -58,18 +58,18 @@ pip install -r requirements.txt
 ### Quick Start
 
 ```bash
-# 3D hand twin + ASL recognition
-python digital_twin.py
-
-# Air-writing canvas
+# Main program: 3D hand twin + ASL recognition
 python main.py
+
+# Extension: air-writing canvas
+python air_writing.py
 ```
 
 ---
 
 ### Usage
 
-#### `digital_twin.py` — 3D Hand Digital Twin
+#### `main.py` — 3D Hand Digital Twin  *(Main Program)*
 
 Displays a perspective-rendered 3D hand that mirrors your real hand. The recognized ASL letter is shown at the bottom of the twin panel.
 
@@ -89,7 +89,7 @@ Displays a perspective-rendered 3D hand that mirrors your real hand. The recogni
 
 ---
 
-#### `main.py` — Air Writing
+#### `air_writing.py` — Air Writing  *(Extension)*
 
 Draw letters in the air with your index finger. Strokes are collected onto a canvas and recognized by a lightweight CNN.
 
@@ -107,14 +107,14 @@ A cyan progress ring appears around the fingertip while holding the V sign; purp
 
 #### ASL Letter Reference
 
-The classifier covers **24 static letters**. J and Z require motion and return `?`.
+The classifier covers all **26 letters**. Static letters (A–Y excl. J) are classified per-frame; J and Z are detected via fingertip motion trajectory and displayed in **orange**.
 
 ![ASL Finger-Spelling Chart](assets/asl_chart.jpg)
 
 ```
-A  B  C  D  E  F  G  H  I  K
-L  M  N  O  P  Q  R  S  T  U
-V  W  X  Y
+A  B  C  D  E  F  G  H  I  J
+K  L  M  N  O  P  Q  R  S  T
+U  V  W  X  Y  Z
 ```
 
 ---
@@ -164,7 +164,7 @@ python train_classifier.py
 
 The script tries both **SVM (RBF kernel)** and **MLP (128-64)**, selects the one with higher 5-fold cross-validation accuracy, and saves the bundle to `asl_classifier.pkl`.
 
-Restart `digital_twin.py` or `main.py` to load the new model automatically.
+Restart `main.py` or `air_writing.py` to load the new model automatically.
 
 #### Optional — Fist-family only
 
@@ -181,15 +181,15 @@ python train_fist_classifier.py
 
 ```
 hand-detection/
-├── main.py                  # Air-writing application
-├── digital_twin.py          # 3D hand twin + ASL overlay
-├── classifier.py            # ASL letter classification logic
+├── main.py                  # Main program — 3D hand twin + ASL overlay
+├── air_writing.py           # Extension — air-writing canvas
+├── classifier.py            # ASL letter classification logic (incl. J/Z detector)
 ├── collect_data.py          # Data collection — all 24 letters
 ├── collect_fist_data.py     # Data collection — fist family
 ├── train_classifier.py      # Train full 24-letter model
 ├── train_fist_classifier.py # Train fist-family model
 ├── requirements.txt
-├── asl_classifier.pkl       # Trained model (auto-loaded, gitignored if large)
+├── asl_classifier.pkl       # Trained model (auto-loaded)
 ├── asl_data.npz             # Collected training data
 ├── fist_classifier.pkl      # Fist-family model
 └── fist_data.npz            # Fist-family training data
@@ -214,9 +214,9 @@ hand-detection/
 
 **MediaPipe** と **OpenCV** を使ったリアルタイム手部トラッキングアプリケーションです。
 
-- **空中描画 (Air Writing)** — 人差し指で空中に文字を描き、CNN でリアルタイム認識
 - **3D デジタルツイン** — 実際の手をミラーリングする透視投影スキンメッシュ
-- **ASL 指文字認識** — アメリカ手話の静的 24 文字（A–Y、動きが必要な J・Z を除く）を分類
+- **ASL 指文字認識** — 全 26 文字に対応（A–Z）；J・Z は動き軌跡で検出
+- **空中描画 (Air Writing)** — 人差し指で空中に文字を描き、CNN でリアルタイム認識
 - **ML トレーニングパイプライン** — 独自の訓練データを収集してカスタム SVM/MLP 分類器を学習
 
 ---
@@ -225,8 +225,8 @@ hand-detection/
 
 | モジュール | 説明 |
 |-----------|------|
-| `main.py` | ジェスチャーショートカット付き空中描画キャンバス |
-| `digital_twin.py` | 3D 手部ツイン + リアルタイム ASL 文字オーバーレイ |
+| `main.py` | **メインプログラム** — 3D 手部ツイン + リアルタイム ASL 文字オーバーレイ |
+| `air_writing.py` | 拡張機能 — ジェスチャーショートカット付き空中描画キャンバス |
 | `classifier.py` | ASL 分類器（幾何学ルール + オプション ML モデル） |
 | `collect_data.py` | 24 文字全ての訓練サンプル収集 |
 | `collect_fist_data.py` | 拳系文字（E/M/N/S/T）の訓練サンプル収集 |
@@ -259,18 +259,18 @@ pip install -r requirements.txt
 ### クイックスタート
 
 ```bash
-# 3D 手部ツイン + ASL 認識
-python digital_twin.py
-
-# 空中描画キャンバス
+# メインプログラム：3D 手部ツイン + ASL 認識
 python main.py
+
+# 拡張機能：空中描画キャンバス
+python air_writing.py
 ```
 
 ---
 
 ### 使い方
 
-#### `digital_twin.py` — 3D デジタルツイン
+#### `main.py` — 3D デジタルツイン  *（メインプログラム）*
 
 実際の手をリアルタイムにミラーリングする透視投影 3D 手部を表示します。認識された ASL 文字はツインパネルの下部に表示されます。
 
@@ -290,7 +290,7 @@ python main.py
 
 ---
 
-#### `main.py` — 空中描画
+#### `air_writing.py` — 空中描画  *（拡張機能）*
 
 人差し指で空中に文字を描きます。ストロークをキャンバスに蓄積し、軽量 CNN で認識します。
 
@@ -308,14 +308,14 @@ V サインホールド中は指先にシアン色のプログレスリングが
 
 #### ASL 文字一覧
 
-分類器は **24 文字の静的手話**に対応しています。J と Z は動きが必要なため `?` を返します。
+分類器は **全 26 文字**に対応しています。静的文字（A–Y、J を除く）はフレーム単位で分類し、J・Z は指先の動き軌跡で検出して**オレンジ色**で表示します。
 
 ![ASL 指文字チャート](assets/asl_chart.jpg)
 
 ```
-A  B  C  D  E  F  G  H  I  K
-L  M  N  O  P  Q  R  S  T  U
-V  W  X  Y
+A  B  C  D  E  F  G  H  I  J
+K  L  M  N  O  P  Q  R  S  T
+U  V  W  X  Y  Z
 ```
 
 ---
@@ -365,7 +365,7 @@ python train_classifier.py
 
 **SVM (RBF カーネル)** と **MLP (128-64)** の両方を試し、5 分割交差検証精度の高い方を選択して `asl_classifier.pkl` に保存します。
 
-`digital_twin.py` や `main.py` を再起動すると新しいモデルが自動読み込みされます。
+`main.py` や `air_writing.py` を再起動すると新しいモデルが自動読み込みされます。
 
 #### オプション — 拳系文字のみ改善する場合
 
@@ -382,9 +382,9 @@ python train_fist_classifier.py
 
 ```
 hand-detection/
-├── main.py                  # 空中描画アプリケーション
-├── digital_twin.py          # 3D 手部ツイン + ASL オーバーレイ
-├── classifier.py            # ASL 文字分類ロジック
+├── main.py                  # メインプログラム — 3D 手部ツイン + ASL オーバーレイ
+├── air_writing.py           # 拡張機能 — 空中描画キャンバス
+├── classifier.py            # ASL 文字分類ロジック（J/Z 動的検出含む）
 ├── collect_data.py          # データ収集 — 24 文字全て
 ├── collect_fist_data.py     # データ収集 — 拳系文字
 ├── train_classifier.py      # 24 文字フルモデルの学習

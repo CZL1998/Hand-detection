@@ -215,3 +215,114 @@ def classify_asl(hand_landmarks, handedness_label):
         return "N"
 
     return "S"             # fallback (z margin was inconclusive)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dynamic gesture detector — J and Z
+# ══════════════════════════════════════════════════════════════════════════════
+
+class JZDetector:
+    """
+    Stateful per-hand detector for dynamic ASL letters J and Z.
+
+    Both letters start from a static prerequisite pose that is held briefly,
+    then the fingertip traces a characteristic path:
+      J : pinky-up (I pose) → downward stroke with a hook at the bottom
+      Z : index-up (D pose) → right → diagonal-down-left → right  (Z shape)
+
+    Usage:
+        det = JZDetector()                              # one per tracked hand
+        letter = det.update(static_letter, lm)         # call every frame
+        # returns 'J', 'Z', or None
+    """
+    _STILL   = 5    # consecutive prerequisite-pose frames to arm tracking
+    _TIMEOUT = 50   # max tracking frames before reset  (≈ 1.7 s at 30 fps)
+    _MIN_SPAN = 0.08  # minimum x+y trajectory span to count as intentional
+
+    def __init__(self):
+        self._prereq   = None   # 'J' or 'Z'
+        self._still    = 0
+        self._tracking = False
+        self._pts: list = []    # (x, y) fingertip positions during tracking
+
+    def update(self, static_letter: str, lm) -> "str | None":
+        """Feed one frame; returns detected letter or None."""
+        if static_letter == 'I':
+            prereq, tip = 'J', (lm[20].x, lm[20].y)   # pinky tip
+        elif static_letter == 'D':
+            prereq, tip = 'Z', (lm[8].x,  lm[8].y)    # index tip
+        else:
+            return self._flush()
+
+        if self._prereq != prereq:
+            self._reset(prereq)
+
+        if not self._tracking:
+            self._still += 1
+            if self._still >= self._STILL:
+                self._tracking = True
+            return None
+
+        self._pts.append(tip)
+        if len(self._pts) > self._TIMEOUT:
+            self._reset()
+            return None
+
+        return self._classify()
+
+    # ── private ────────────────────────────────────────────────────
+
+    def _flush(self):
+        result = self._classify() if self._tracking else None
+        self._reset()
+        return result
+
+    def _reset(self, prereq=None):
+        self._prereq   = prereq
+        self._still    = 0
+        self._tracking = False
+        self._pts      = []
+
+    def _classify(self):
+        pts = self._pts
+        if len(pts) < 8:
+            return None
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        span_x = max(xs) - min(xs)
+        span_y = max(ys) - min(ys)
+        if span_x + span_y < self._MIN_SPAN:
+            return None
+        letter = _jz_j(xs, ys, span_x, span_y) if self._prereq == 'J' \
+            else _jz_z(xs, ys, span_x, span_y)
+        if letter:
+            self._reset()
+        return letter
+
+
+def _jz_j(xs, ys, span_x, span_y):
+    """J: downward stroke + lateral hook at the bottom."""
+    net_dy = ys[-1] - ys[0]      # positive = moved down (screen y increases)
+    if net_dy > 0.08 and span_y > span_x and span_x > 0.04:
+        return 'J'
+    return None
+
+
+def _jz_z(xs, ys, span_x, span_y):
+    """Z: index tip traces right → down-left → right  (2 x-direction reversals)."""
+    if span_x < 0.10 or span_y < 0.05:
+        return None
+    # Hysteresis: must move 12 % of total span before a direction change counts
+    step      = span_x * 0.12
+    reversals = 0
+    anchor    = xs[0]
+    last_dir  = 0
+    for x in xs[1:]:
+        diff = x - anchor
+        if abs(diff) > step:
+            curr = 1 if diff > 0 else -1
+            if last_dir != 0 and curr != last_dir:
+                reversals += 1
+            last_dir = curr
+            anchor   = x
+    return 'Z' if reversals >= 2 else None
